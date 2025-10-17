@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AYO — timed BG + synced bounce</title>
+<style>
+  :root { --logo-color: #ffffff; }
+  html,body{ height:100%; margin:0; padding:0; overflow:hidden; background:#000; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Open Sans", sans-serif; }
+  /* overlay we will tint every interval */
+  #bgOverlay { position:fixed; inset:0; z-index:0; background:#000; transition: background-color 420ms ease; pointer-events:none; }
+  .stage { position:relative; z-index:2; width:100vw; height:100vh; user-select:none; }
+  .logo-link { position:absolute; display:inline-block; color:var(--logo-color); text-decoration:none; cursor:pointer; transform: translate3d(0,0,0); }
+  .tooltip { position:absolute; left:50%; transform:translateX(-50%); bottom:calc(100% + 8px); background:rgba(255,255,255,0.06); color:#fff; padding:6px 10px; font-size:13px; border-radius:6px; white-space:nowrap; opacity:0; pointer-events:none; transition:opacity .12s ease, transform .12s ease; }
+  .logo-link:hover .tooltip { opacity:1; transform:translateX(-50%) translateY(-6px); }
+  .logo-svg { display:block; width:280px; height:auto; pointer-events:none; filter: drop-shadow(0 12px 30px rgba(0,0,0,0.55)); }
+  .flash { animation: pulse .18s ease; }
+  @keyframes pulse { 0%{ transform: scale(1);} 50%{ transform: scale(1.12);} 100%{ transform: scale(1);} }
+  @media (max-width:600px) { .logo-svg { width:160px; } }
+</style>
+</head>
+<body>
+
+<div id="bgOverlay" aria-hidden="true"></div>
+
+<div class="stage" id="stage">
+  <a class="logo-link" id="logoLink" href="mailto:hello@ayo.la" aria-label="Email AYO">
+    <div class="tooltip">say hello!</div>
+    <div id="logoContainer" class="logo-svg" aria-hidden="true"></div>
+  </a>
+</div>
+
+<script>
+if (!window.__AYO_LOADED) {
+  window.__AYO_LOADED = true;
+
+  (function () {
+    // ---------------- CONFIG ----------------
+    const SVG_PATH = 'images/ayo_white.svg'; // relative path
+    const BG_INTERVAL_MS = 3000;            // background change interval (ms)
+    const ARRIVAL_BUFFER_MS = 60;           // small buffer
+    const MAX_SPEED_PX_PER_S = 1400;        // safety cap for velocity (px/sec)
+
+    // DVD-ish palettes
+    const DVD_LOGO_PALETTE = ['#FF2D55','#00C853','#00ADEF','#FFD100','#FF00A8','#FFFFFF','#FF6A00'];
+    const DVD_BG_OVERLAY    = ['rgba(42,0,22,1)','rgba(8,58,25,1)','rgba(0,51,69,1)','rgba(58,43,0,1)','rgba(42,0,22,1)','rgba(34,34,34,1)','rgba(58,24,0,1)'];
+
+    // ---------------- DOM ----------------
+    const logoLink = document.getElementById('logoLink');
+    const logoContainer = document.getElementById('logoContainer');
+    const bgOverlay = document.getElementById('bgOverlay');
+
+    // ---------------- inline SVG and force currentColor ----------------
+    async function inlineAndForceSVG() {
+      try {
+        const res = await fetch(SVG_PATH);
+        if (!res.ok) throw new Error('SVG fetch failed: ' + res.status);
+        const raw = await res.text();
+
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(raw, 'image/svg+xml');
+        const svg = doc.querySelector('svg');
+        if (!svg) throw new Error('No <svg> found');
+
+        svg.removeAttribute('width');
+        svg.removeAttribute('height');
+        svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+        const selector = 'path, circle, rect, ellipse, polygon, polyline, g, use';
+        const shapes = Array.from(svg.querySelectorAll(selector));
+        shapes.forEach(el => {
+          if (el.hasAttribute('fill')) el.removeAttribute('fill');
+          if (el.hasAttribute('stroke')) el.removeAttribute('stroke');
+          try { el.setAttribute('fill','currentColor'); } catch(e){}
+        });
+
+        const styleNode = doc.createElementNS('http://www.w3.org/2000/svg','style');
+        styleNode.textContent = '*{ fill: currentColor !important; stroke:none !important; }';
+        svg.insertBefore(styleNode, svg.firstChild);
+
+        const cleaned = new XMLSerializer().serializeToString(svg);
+        logoContainer.innerHTML = cleaned;
+
+        const injected = logoContainer.querySelector('svg');
+        if (injected) {
+          injected.style.display = 'block';
+          injected.style.width = '100%';
+          injected.style.height = '100%';
+          injected.style.pointerEvents = 'none';
+          injected.style.color = getComputedStyle(logoLink).color || '#fff';
+        }
+        console.log('SVG inlined; shapes processed:', shapes.length);
+        return true;
+      } catch (err) {
+        console.error('inlineAndForceSVG error:', err);
+        logoContainer.textContent = 'AYO';
+        return false;
+      }
+    }
+
+    // ---------------- motion state ----------------
+    let posX = 120, posY = 80;   // px
+    let velX = 0, velY = 0;     // px/sec (we update using deltaTime)
+    let logoW = 280, logoH = 280;
+    let lastTimestamp = null;
+    let lastColorIndex = -1;
+
+    function measureLogo() {
+      const r = logoContainer.getBoundingClientRect();
+      logoW = r.width || 280;
+      logoH = r.height || 280;
+    }
+
+    // convert index -> apply colors (overlay + logo)
+    function applyColorsForIndex(idx) {
+      const logoColor = DVD_LOGO_PALETTE[idx];
+      const overlayColor = DVD_BG_OVERLAY[idx] || '#000';
+      document.documentElement.style.setProperty('--logo-color', logoColor);
+      logoLink.style.color = logoColor;
+      const svg = logoContainer.querySelector('svg');
+      if (svg) svg.style.color = logoColor;
+      // apply overlay directly (reliable)
+      bgOverlay.style.backgroundColor = overlayColor;
+      document.body.style.backgroundColor = overlayColor;
+      console.log('APPLY COLORS', { idx, logoColor, overlayColor });
+    }
+
+    // pick a random index different from last
+    function pickDifferentIndex() {
+      if (DVD_LOGO_PALETTE.length <= 1) return 0;
+      let i = Math.floor(Math.random() * DVD_LOGO_PALETTE.length);
+      let attempts = 0;
+      while (i === lastColorIndex && attempts < 12) {
+        i = Math.floor(Math.random() * DVD_LOGO_PALETTE.length);
+        attempts++;
+      }
+      if (i === lastColorIndex) i = (lastColorIndex + 1) % DVD_LOGO_PALETTE.length;
+      lastColorIndex = i;
+      return i;
+    }
+
+    // choose a corner target (random) and compute velX/velY so we reach it in durationMs
+    function aimForCornerIn(durationMs) {
+      measureLogo(); // make sure size is current
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      // choose corner randomly (or we could choose nearest)
+      const corners = [
+        { x: 0, y: 0 },                          // left-top
+        { x: w - logoW, y: 0 },                  // right-top
+        { x: 0, y: h - logoH },                  // left-bottom
+        { x: w - logoW, y: h - logoH }           // right-bottom
+      ];
+      // pick the corner furthest away to make motion visible (or random)
+      let idxCorner = Math.floor(Math.random() * corners.length);
+      // compute required px/sec
+      const target = corners[idxCorner];
+      const dtSec = Math.max(0.001, durationMs / 1000); // seconds
+      let reqVx = (target.x - posX) / dtSec;
+      let reqVy = (target.y - posY) / dtSec;
+      // cap speeds
+      const cap = MAX_SPEED_PX_PER_S;
+      const mag = Math.hypot(reqVx, reqVy);
+      if (mag > cap) {
+        const scale = cap / mag;
+        reqVx *= scale;
+        reqVy *= scale;
+      }
+      velX = reqVx;
+      velY = reqVy;
+      // log
+      console.log('AIM corner', { target, durationMs, velX: Math.round(velX), velY: Math.round(velY) });
+    }
+
+    // time-based animation loop
+    function animate(timestamp) {
+      if (!lastTimestamp) lastTimestamp = timestamp;
+      const dt = (timestamp - lastTimestamp) / 1000; // seconds
+      lastTimestamp = timestamp;
+
+      // move
+      posX += velX * dt;
+      posY += velY * dt;
+
+      // simple bounds clamp (so it doesn't drift off)
+      const W = window.innerWidth, H = window.innerHeight;
+      if (posX < 0) { posX = 0; velX = Math.abs(velX) * 0.85; }
+      if (posY < 0) { posY = 0; velY = Math.abs(velY) * 0.85; }
+      if (posX + logoW > W) { posX = W - logoW; velX = -Math.abs(velX) * 0.85; }
+      if (posY + logoH > H) { posY = H - logoH; velY = -Math.abs(velY) * 0.85; }
+
+      // apply to DOM
+      logoLink.style.left = Math.round(posX) + 'px';
+      logoLink.style.top  = Math.round(posY) + 'px';
+
+      requestAnimationFrame(animate);
+    }
+
+    // helper: trigger background color change + retarget logo
+    function tickBackgroundAndRetarget() {
+      const idx = pickDifferentIndex();
+      applyColorsForIndex(idx);
+      // aim the logo to reach some corner by the end of the next interval
+      aimForCornerIn(BG_INTERVAL_MS - ARRIVAL_BUFFER_MS);
+      // optional pulse shortly after retarget to emphasize
+      logoContainer.classList.add('flash');
+      setTimeout(()=> logoContainer.classList.remove('flash'), 180);
+    }
+
+    // ---------------- startup ----------------
+    (async function start() {
+      const ok = await inlineAndForceSVG();
+      // initial placement and sizing
+      measureLogo();
+      posX = Math.max(12, Math.round(window.innerWidth * 0.12));
+      posY = Math.max(12, Math.round(window.innerHeight * 0.12));
+      // start with white bg/logo
+      applyColorsForIndex(5); // white
+      // schedule repeating background ticks
+      tickBackgroundAndRetarget(); // first tick immediately
+      const intervalId = setInterval(tickBackgroundAndRetarget, BG_INTERVAL_MS);
+
+      // start animation loop
+      requestAnimationFrame(animate);
+
+      // cleanup if needed (not required, but good practice)
+      window.addEventListener('beforeunload', ()=> { clearInterval(intervalId); });
+    })();
+
+    // responsive safety
+    window.addEventListener('resize', ()=> {
+      measureLogo();
+      posX = Math.min(posX, window.innerWidth - logoW);
+      posY = Math.min(posY, window.innerHeight - logoH);
+    });
+
+    // keyboard accessibility
+    logoLink.addEventListener('keydown', (e)=> {
+      if ((e.key === 'Enter' || e.key === ' ') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        window.location.href = logoLink.href;
+      }
+    });
+
+  })();
+} else {
+  console.log('AYO script already loaded — skipping duplicate init.');
+}
+</script>
+</body>
+</html>
